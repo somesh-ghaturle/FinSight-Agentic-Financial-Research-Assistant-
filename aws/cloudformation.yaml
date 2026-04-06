@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  FinSight – Agentic Financial Research Assistant
+  Deploys FastAPI + Streamlit on AWS ECS Fargate with ALB, Secrets Manager,
+  and CloudWatch logging.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy FinSight into
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets for ALB and ECS tasks
+
+  ECRApiImage:
+    Type: String
+    Description: ECR image URI for the FastAPI container (e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/finsight-api:latest)
+
+  ECRUiImage:
+    Type: String
+    Description: ECR image URI for the Streamlit container
+
+  OpenAIApiKeySecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret holding OPENAI_API_KEY
+
+  PineconeApiKeySecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret holding PINECONE_API_KEY
+
+  LlmModel:
+    Type: String
+    Default: gpt-4o-mini
+
+  VectorStoreBackend:
+    Type: String
+    Default: pinecone
+    AllowedValues: [faiss, pinecone]
+
+Resources:
+
+  # ── IAM ──────────────────────────────────────────────────────────────────────
+
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "finsight-ecs-execution-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource:
+                  - !Ref OpenAIApiKeySecretArn
+                  - !Ref PineconeApiKeySecretArn
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "finsight-ecs-task-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3MLflowArtifacts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !Sub "arn:aws:s3:::finsight-mlflow-${Environment}/*"
+                  - !Sub "arn:aws:s3:::finsight-mlflow-${Environment}"
+
+  # ── Security Groups ───────────────────────────────────────────────────────────
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP/HTTPS to ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ALB to reach ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8501
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  # ── CloudWatch Log Groups ─────────────────────────────────────────────────────
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/finsight-api
+      RetentionInDays: 30
+
+  UiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/finsight-ui
+      RetentionInDays: 30
+
+  # ── ECS Cluster ───────────────────────────────────────────────────────────────
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "finsight-${Environment}"
+
+  # ── Task Definition ───────────────────────────────────────────────────────────
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "finsight-${Environment}"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: "1024"
+      Memory: "2048"
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: finsight-api
+          Image: !Ref ECRApiImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+          Environment:
+            - Name: VECTOR_STORE_BACKEND
+              Value: !Ref VectorStoreBackend
+            - Name: LLM_MODEL
+              Value: !Ref LlmModel
+          Secrets:
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Ref OpenAIApiKeySecretArn
+            - Name: PINECONE_API_KEY
+              ValueFrom: !Ref PineconeApiKeySecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/finsight-api
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 60
+
+        - Name: finsight-ui
+          Image: !Ref ECRUiImage
+          Essential: true
+          Command:
+            - streamlit
+            - run
+            - ui/app.py
+            - --server.port=8501
+            - --server.address=0.0.0.0
+          PortMappings:
+            - ContainerPort: 8501
+          Environment:
+            - Name: STREAMLIT_API_URL
+              Value: http://localhost:8000
+          Secrets:
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Ref OpenAIApiKeySecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/finsight-ui
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          DependsOn:
+            - ContainerName: finsight-api
+              Condition: HEALTHY
+
+  # ── ALB ───────────────────────────────────────────────────────────────────────
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "finsight-alb-${Environment}"
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "finsight-api-tg-${Environment}"
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /api/v1/health
+      HealthCheckIntervalSeconds: 30
+
+  UiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "finsight-ui-tg-${Environment}"
+      Port: 8501
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref UiTargetGroup
+
+  AlbApiListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values: ["/api/*"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiTargetGroup
+
+  # ── ECS Service ───────────────────────────────────────────────────────────────
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: AlbListener
+    Properties:
+      ServiceName: !Sub "finsight-${Environment}"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref EcsSecurityGroup]
+      LoadBalancers:
+        - ContainerName: finsight-api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref ApiTargetGroup
+        - ContainerName: finsight-ui
+          ContainerPort: 8501
+          TargetGroupArn: !Ref UiTargetGroup
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt LoadBalancer.DNSName
+
+  UIUrl:
+    Description: FinSight Streamlit UI URL
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+
+  ApiUrl:
+    Description: FinSight FastAPI backend URL
+    Value: !Sub "http://${LoadBalancer.DNSName}/api/v1"

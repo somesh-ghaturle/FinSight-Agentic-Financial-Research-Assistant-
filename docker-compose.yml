@@ -1,0 +1,70 @@
+version: "3.9"
+
+services:
+  # ── FastAPI backend ───────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: finsight-api
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PINECONE_API_KEY=${PINECONE_API_KEY:-}
+      - PINECONE_ENVIRONMENT=${PINECONE_ENVIRONMENT:-us-east-1-aws}
+      - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME:-finsight-sec-filings}
+      - VECTOR_STORE_BACKEND=${VECTOR_STORE_BACKEND:-faiss}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MLFLOW_EXPERIMENT_NAME=${MLFLOW_EXPERIMENT_NAME:-finsight-evaluation}
+      - SEC_EDGAR_USER_AGENT=${SEC_EDGAR_USER_AGENT:-FinSight research@finsight.example.com}
+    volumes:
+      - faiss-data:/app/data/faiss_index
+      - mlflow-data:/app/mlflow.db
+    depends_on:
+      - mlflow
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Streamlit frontend ────────────────────────────────────────────────────
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: finsight-ui
+    command: ["streamlit", "run", "ui/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports:
+      - "8501:8501"
+    environment:
+      - STREAMLIT_API_URL=http://api:8000
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── MLflow tracking server ────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    container_name: finsight-mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    restart: unless-stopped
+
+volumes:
+  faiss-data:
+  mlflow-data:
