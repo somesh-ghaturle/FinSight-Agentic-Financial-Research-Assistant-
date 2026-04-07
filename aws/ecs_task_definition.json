@@ -1,0 +1,112 @@
+{
+  "family": "finsight",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "finsight-api",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/finsight-api:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {"name": "VECTOR_STORE_BACKEND", "value": "pinecone"},
+        {"name": "LLM_MODEL", "value": "gpt-4o-mini"},
+        {"name": "MLFLOW_EXPERIMENT_NAME", "value": "finsight-evaluation"}
+      ],
+      "secrets": [
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:finsight/openai_api_key"
+        },
+        {
+          "name": "PINECONE_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:finsight/pinecone_api_key"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/finsight-api",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    },
+    {
+      "name": "finsight-ui",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/finsight-ui:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8501,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {"name": "STREAMLIT_API_URL", "value": "http://localhost:8000"}
+      ],
+      "secrets": [
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:finsight/openai_api_key"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/finsight-ui",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "dependsOn": [
+        {
+          "containerName": "finsight-api",
+          "condition": "HEALTHY"
+        }
+      ]
+    },
+    {
+      "name": "finsight-mlflow",
+      "image": "ghcr.io/mlflow/mlflow:v2.13.0",
+      "essential": false,
+      "command": [
+        "mlflow", "server",
+        "--backend-store-uri", "sqlite:///mlflow.db",
+        "--default-artifact-root", "s3://BUCKET_NAME/mlflow-artifacts",
+        "--host", "0.0.0.0",
+        "--port", "5000"
+      ],
+      "portMappings": [
+        {
+          "containerPort": 5000,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/finsight-mlflow",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
